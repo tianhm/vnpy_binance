@@ -25,6 +25,7 @@ from vnpy.trader.object import (
     OrderData,
     TradeData,
     AccountData,
+    PositionData,
     ContractData,
     BarData,
     OrderRequest,
@@ -90,6 +91,15 @@ TIMEDELTA_MAP: dict[Interval, timedelta] = {
     Interval.DAILY: timedelta(days=1),
 }
 
+# Spot assets kept as AccountData (cash / stablecoins)
+ACCOUNT_ASSETS: set[str] = {
+    "USDT", "USDC", "FDUSD", "TUSD", "BUSD",
+    "USDP", "DAI", "USDE", "USD1", "BFUSD",
+}
+
+# Quote priority when mapping non-stable assets to PositionData
+POSITION_QUOTE_ASSETS: tuple[str, ...] = ("USDT", "USDC")
+
 # Set weboscket timeout to 24 hour
 WEBSOCKET_TIMEOUT = 24 * 60 * 60
 
@@ -141,6 +151,7 @@ class BinanceSpotGateway(BaseGateway):
         self.orders: dict[str, OrderData] = {}
         self.symbol_contract_map: dict[str, ContractData] = {}
         self.name_contract_map: dict[str, ContractData] = {}
+        self.asset_position_map: dict[str, str] = {}  # asset -> contract.symbol
 
     def connect(self, setting: dict) -> None:
         """
@@ -298,6 +309,66 @@ class BinanceSpotGateway(BaseGateway):
             Contract data object if found, None otherwise
         """
         return self.name_contract_map.get(name, None)
+
+    def process_balance(self, asset: str, free: float, locked: float) -> None:
+        """
+        Split spot balances into AccountData (stables) or PositionData (others).
+
+        Stablecoins stay as account cash. Other assets with a USDT/USDC spot
+        contract are published as net positions so Flow can track get_pos().
+        Zero balances are pushed only for previously tracked position assets.
+        """
+        volume: float = free + locked
+
+        # Stablecoins remain AccountData
+        if asset in ACCOUNT_ASSETS:
+            if volume:
+                account: AccountData = AccountData(
+                    accountid=asset,
+                    balance=volume,
+                    frozen=locked,
+                    gateway_name=self.gateway_name
+                )
+                self.on_account(account)
+            return
+
+        # Resolve trading pair for position mapping (USDT first, then USDC)
+        contract: ContractData | None = None
+        for quote in POSITION_QUOTE_ASSETS:
+            contract = self.get_contract_by_name(f"{asset}{quote}")
+            if contract:
+                break
+
+        # No matching spot pair: keep as AccountData when non-zero
+        if not contract:
+            if volume:
+                account = AccountData(
+                    accountid=asset,
+                    balance=volume,
+                    frozen=locked,
+                    gateway_name=self.gateway_name
+                )
+                self.on_account(account)
+            return
+
+        symbol: str = contract.symbol
+        if volume:
+            self.asset_position_map[asset] = symbol
+        elif asset not in self.asset_position_map:
+            return
+        else:
+            self.asset_position_map.pop(asset, None)
+
+        position: PositionData = PositionData(
+            symbol=symbol,
+            exchange=Exchange.GLOBAL,
+            direction=Direction.NET,
+            volume=volume,
+            frozen=locked,
+            price=0,
+            gateway_name=self.gateway_name,
+        )
+        self.on_position(position)
 
     def process_timer_event(self, event: Event) -> None:
         """
@@ -528,7 +599,7 @@ class RestApi(RestClient):
         Callback of account balance query.
 
         This function processes the account balance response and
-        creates AccountData objects for each asset in the account.
+        maps stablecoins to AccountData and other assets to PositionData.
 
         Parameters:
             data: Response data from the server
@@ -538,15 +609,7 @@ class RestApi(RestClient):
             asset = balance["asset"]
             free = float(balance["free"])
             locked = float(balance["locked"])
-
-            if free or locked:
-                account: AccountData = AccountData(
-                    accountid=asset,
-                    balance=free + locked,
-                    frozen=locked,
-                    gateway_name=self.gateway_name
-                )
-                self.gateway.on_account(account)
+            self.gateway.process_balance(asset, free, locked)
 
         self.gateway.write_log("Account data received")
 
@@ -1293,7 +1356,7 @@ class TradeApi(WebsocketClient):
         Callback of account balance update.
 
         This function processes the account update event from the user data stream,
-        including balance changes.
+        mapping stablecoins to AccountData and other assets to PositionData.
 
         Parameters:
             event: Event payload from user data stream
@@ -1302,15 +1365,7 @@ class TradeApi(WebsocketClient):
             asset = balance["a"]
             free = float(balance["f"])
             locked = float(balance["l"])
-
-            if free or locked:
-                account: AccountData = AccountData(
-                    accountid=asset,
-                    balance=free + locked,
-                    frozen=locked,
-                    gateway_name=self.gateway_name
-                )
-                self.gateway.on_account(account)
+            self.gateway.process_balance(asset, free, locked)
 
     def on_order(self, event: dict) -> None:
         """
