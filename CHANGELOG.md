@@ -1,3 +1,7 @@
+# 2026.07.23
+
+1. map non-stable coin as position data (instead of account data)
+
 # 2026.06.28
 
 1. fix open orders filtered out in linear and inverse gateways due to wrong contract lookup
